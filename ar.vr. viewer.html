@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Mixed Reality Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body { margin: 0; background: #111; color: #eee; font-family: sans-serif; }
+    #app { padding: 8px; }
+    #viewer { width: 100%; height: 70vh; background: black; }
+    button, input[type=file] {
+      margin: 4px; padding: 8px; border: none; border-radius: 6px;
+      background: #333; color: #fff; font-size: 14px;
+    }
+    button:hover { background: #555; }
+    .status { font-size: 12px; color: #aaa; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <h2>📱 Mixed Reality Viewer</h2>
+    <p>Lade ein 3D-Modell (.glb / .gltf) und schau es dir in VR, AR oder MR an.</p>
+    <input type="file" id="fileInput" accept=".glb,.gltf" />
+    <button onclick="enterXR('immersive-vr')">Enter VR</button>
+    <button onclick="enterXR('immersive-ar')">Enter AR</button>
+    <button onclick="toggleMRCamera()">Start MR Camera</button>
+    <div id="viewer"></div>
+    <div class="status" id="status">Status: Ready</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.158.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js";
+    import { GLTFLoader } from "https://unpkg.com/three@0.158.0/examples/jsm/loaders/GLTFLoader.js";
+    import { DRACOLoader } from "https://unpkg.com/three@0.158.0/examples/jsm/loaders/DRACOLoader.js";
+
+    const container = document.getElementById("viewer");
+    const statusEl = document.getElementById("status");
+    let camera, scene, renderer, controls, mixer;
+    let video, videoTexture, isCameraOn = false;
+
+    // Renderer
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.xr.enabled = true;
+    container.appendChild(renderer.domElement);
+
+    // Scene & Camera
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(70, container.clientWidth / container.clientHeight, 0.01, 100);
+    camera.position.set(0, 1.6, 2);
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1, 0);
+    controls.update();
+
+    // Lights
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1));
+    const dir = new THREE.DirectionalLight(0xffffff, 1);
+    dir.position.set(3, 10, 10);
+    scene.add(dir);
+
+    // Ground Grid
+    const grid = new THREE.GridHelper(10, 20, 0x888888, 0x222222);
+    grid.material.opacity = 0.2;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    // Animation loop
+    const clock = new THREE.Clock();
+    renderer.setAnimationLoop(() => {
+      const dt = clock.getDelta();
+      if (mixer) mixer.update(dt);
+      renderer.render(scene, camera);
+    });
+
+    // File loader
+    const loader = new GLTFLoader();
+    const draco = new DRACOLoader();
+    draco.setDecoderPath("https://www.gstatic.com/draco/v1/decoders/");
+    loader.setDRACOLoader(draco);
+
+    document.getElementById("fileInput").addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      statusEl.textContent = "Status: Loading model...";
+      const arrayBuffer = await file.arrayBuffer();
+      loader.parse(arrayBuffer, "", (gltf) => {
+        scene.clear();
+        scene.add(grid, dir);
+        const root = gltf.scene;
+        // Normalize scale & center
+        const bbox = new THREE.Box3().setFromObject(root);
+        const size = bbox.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z);
+        const scale = maxDim > 1 ? 1.0 / maxDim : 1.0;
+        root.scale.setScalar(scale);
+        bbox.setFromObject(root);
+        const center = bbox.getCenter(new THREE.Vector3());
+        root.position.sub(center);
+        scene.add(root);
+        if (gltf.animations.length > 0) {
+          mixer = new THREE.AnimationMixer(root);
+          gltf.animations.forEach((clip) => mixer.clipAction(clip).play());
+        }
+        statusEl.textContent = "Status: Model loaded (" + file.name + ")";
+      });
+    });
+
+    // Enter VR/AR
+    async function enterXR(mode) {
+      if (!navigator.xr) {
+        statusEl.textContent = "WebXR not supported";
+        return;
+      }
+      try {
+        const session = await navigator.xr.requestSession(mode, { optionalFeatures: ["local-floor", "bounded-floor"] });
+        renderer.xr.setSession(session);
+        statusEl.textContent = "Status: " + mode + " active";
+      } catch (err) {
+        statusEl.textContent = "Failed: " + err.message;
+      }
+    }
+    window.enterXR = enterXR;
+
+    // Camera MR
+    async function toggleMRCamera() {
+      if (isCameraOn) {
+        if (video && video.srcObject) {
+          video.srcObject.getTracks().forEach((t) => t.stop());
+        }
+        scene.background = null;
+        statusEl.textContent = "Status: Camera stopped";
+        isCameraOn = false;
+        return;
+      }
+      try {
+        video = document.createElement("video");
+        video.autoplay = true;
+        video.playsInline = true;
+        video.muted = true;
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        video.srcObject = stream;
+        await video.play();
+        videoTexture = new THREE.VideoTexture(video);
+        scene.background = videoTexture;
+        isCameraOn = true;
+        statusEl.textContent = "Status: MR Camera running";
+      } catch (err) {
+        statusEl.textContent = "Camera error: " + err.message;
+      }
+    }
+    window.toggleMRCamera = toggleMRCamera;
+
+    // Resize
+    window.addEventListener("resize", () => {
+      camera.aspect = container.clientWidth / container.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    });
+  </script>
+</body>
+</html>
